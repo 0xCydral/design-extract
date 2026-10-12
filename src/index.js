@@ -64,7 +64,7 @@ export async function extractDesignLanguage(url, options = {}) {
       elementCount: styles.length,
       pagesAnalyzed: rawData.pagesAnalyzed || 1,
     },
-    colors: safeExtract(extractColors, styles) || { primary: null, secondary: null, accent: null, neutrals: [], backgrounds: [], text: [], gradients: [], all: [] },
+    colors: safeExtract(extractColors, styles, { cssVariables: rawData.light.cssVariables }) || { primary: null, secondary: null, accent: null, neutrals: [], backgrounds: [], text: [], gradients: [], all: [] },
     typography: safeExtract(extractTypography, styles, { fluidValues: rawData.light.fluidValues || [], viewportWidth: rawData.light.viewport?.width }) || { families: [], scale: [] },
     spacing: safeExtract(extractSpacing, styles) || { scale: [], base: null },
     shadows: safeExtract(extractShadows, styles) || { values: [] },
@@ -119,7 +119,7 @@ export async function extractDesignLanguage(url, options = {}) {
   }
 
   if (rawData.dark) {
-    const darkColors = safeExtract(extractColors, rawData.dark.computedStyles) || { primary: null, secondary: null, accent: null, neutrals: [], backgrounds: [], text: [], gradients: [], all: [] };
+    const darkColors = safeExtract(extractColors, rawData.dark.computedStyles, { cssVariables: rawData.dark.cssVariables }) || { primary: null, secondary: null, accent: null, neutrals: [], backgrounds: [], text: [], gradients: [], all: [] };
     design.darkMode = {
       // Issue #110: fold the prefers-color-scheme media pass into the dark
       // colours so sites that ship dark mode only via @media still yield a set.

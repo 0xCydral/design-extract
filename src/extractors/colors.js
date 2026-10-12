@@ -13,7 +13,42 @@ function isInteractive(el) {
   return false;
 }
 
-export function extractColors(computedStyles) {
+// A link around a whole card or a full-width banner is a surface, not a
+// button: linear.app's customer-story tile is an <a> 432x480 painted #e4f222.
+// Elements without a measured box (older captures) keep counting.
+const MAX_CTA_WIDTH = 800;
+const MAX_CTA_HEIGHT = 120;
+function isCtaSized(el) {
+  if (typeof el.width !== 'number' || typeof el.height !== 'number') return true;
+  return el.width <= MAX_CTA_WIDTH && el.height <= MAX_CTA_HEIGHT;
+}
+
+// Variables a site names for its own brand colour: --brand, --color-primary,
+// --color-brand-bg, --color-accent. Not --color-text-primary or
+// --color-bg-primary, which are roles for other things.
+const BRAND_VAR_RE = /^--(?:(?:color|colors|clr|theme)-)?(brand|primary|accent)(?:-(?:bg|background|color|default|base|main|500|600))?$/i;
+const BRAND_VAR_WEIGHT = { brand: 1, primary: 1, accent: 0.6 };
+const BRAND_VAR_BONUS = 120;
+
+function resolveVar(value, vars, depth = 0) {
+  const m = typeof value === 'string' && value.trim().match(/^var\(\s*(--[\w-]+)\s*(?:,[^)]*)?\)$/);
+  if (!m || depth > 3 || vars[m[1]] === undefined) return value;
+  return resolveVar(vars[m[1]], vars, depth + 1);
+}
+
+// The colours the site's own CSS calls brand, as { parsed, weight }.
+function declaredBrandColors(cssVariables) {
+  const found = [];
+  for (const [name, raw] of Object.entries(cssVariables || {})) {
+    const m = BRAND_VAR_RE.exec(name);
+    if (!m) continue;
+    const parsed = parseColor(resolveVar(raw, cssVariables));
+    if (parsed && parsed.a > 0) found.push({ parsed, weight: BRAND_VAR_WEIGHT[m[1].toLowerCase()] });
+  }
+  return found;
+}
+
+export function extractColors(computedStyles, { cssVariables } = {}) {
   const colorMap = new Map(); // hex -> { hex, parsed, count, contexts: Set, interactiveBg: number }
 
   function addColor(value, context, { interactive = false, area = 0 } = {}) {
@@ -21,7 +56,7 @@ export function extractColors(computedStyles) {
     if (!parsed || parsed.a === 0) return;
     const hex = rgbToHex(parsed);
     if (!colorMap.has(hex)) {
-      colorMap.set(hex, { hex, parsed, count: 0, contexts: new Set(), interactiveBg: 0, area: 0 });
+      colorMap.set(hex, { hex, parsed, count: 0, contexts: new Set(), interactiveBg: 0, interactiveText: 0, area: 0 });
     }
     const entry = colorMap.get(hex);
     entry.count++;
@@ -30,14 +65,15 @@ export function extractColors(computedStyles) {
     // hundred 16px icons, which is how a person reads a page.
     if (context === 'background') entry.area += area;
     if (interactive && context === 'background') entry.interactiveBg++;
+    if (interactive && context === 'text') entry.interactiveText++;
   }
 
   const gradients = new Set();
 
   for (const el of computedStyles) {
     const interactive = isInteractive(el);
-    addColor(el.color, 'text');
-    addColor(el.backgroundColor, 'background', { interactive, area: el.area || 0 });
+    addColor(el.color, 'text', { interactive });
+    addColor(el.backgroundColor, 'background', { interactive: interactive && isCtaSized(el), area: el.area || 0 });
     addColor(el.borderColor, 'border');
 
     if (el.backgroundImage && el.backgroundImage !== 'none' && el.backgroundImage.includes('gradient')) {
@@ -52,6 +88,7 @@ export function extractColors(computedStyles) {
   const totalArea = allColors.reduce((s, c) => s + (c.area || 0), 0);
   for (const cluster of clusters) {
     cluster.interactiveBg = cluster.members.reduce((s, m) => s + (m.interactiveBg || 0), 0);
+    cluster.interactiveText = cluster.members.reduce((s, m) => s + (m.interactiveText || 0), 0);
     cluster.area = cluster.members.reduce((s, m) => s + (m.area || 0), 0);
     cluster.areaShare = totalArea > 0 ? cluster.area / totalArea : 0;
     const { s: sat, l: lit } = rgbToHsl(cluster.representative);
@@ -81,15 +118,26 @@ export function extractColors(computedStyles) {
     }
   }
 
-  // Text colors: from color property
-  const textColors = [];
+  // Text colors, most prominent first. The first colour in document order is
+  // the <html> default (stripe.com: #000000, which no visible text uses), so
+  // order by the area of text actually painted. Headings count four times:
+  // they carry the page's ink (stripe: #061b31 on headings, #50617a on links).
+  // Elements without hasText/area (older captures) count as one unit of text.
+  const textWeight = new Map();
+  const textOrder = [];
   for (const el of computedStyles) {
     const parsed = parseColor(el.color);
-    if (parsed && parsed.a > 0) {
-      const hex = rgbToHex(parsed);
-      if (!textColors.includes(hex)) textColors.push(hex);
-    }
+    if (!parsed || parsed.a === 0) continue;
+    const hex = rgbToHex(parsed);
+    if (!textWeight.has(hex)) { textWeight.set(hex, 0); textOrder.push(hex); }
+    if (el.hasText === false || el.area === 0) continue;
+    const painted = typeof el.area === 'number' ? el.area : 1;
+    textWeight.set(hex, textWeight.get(hex) + painted * (/^h[1-6]$/.test(el.tag) ? 4 : 1));
   }
+  const textColors = textOrder
+    .map((hex, i) => ({ hex, i, w: textWeight.get(hex) }))
+    .sort((a, b) => b.w - a.w || a.i - b.i)
+    .map((c) => c.hex);
 
   // Rank chromatic clusters by brand-likelihood. Measured on real sites
   // (bench/), linear weights let one button decide: 100 points per interactive
@@ -103,20 +151,45 @@ export function extractColors(computedStyles) {
   // near-black #101214 on atlassian.com (chroma 1.5) got in through two dark
   // buttons and then won on 702 uses. Area has diminishing returns, since one
   // full-page background (84% of discord.com) is a surface, not repetition.
+  // The site's own CSS naming a colour as brand/primary/accent is the best
+  // evidence there is (linear.app: --color-brand-bg #5e6ad2, painted on one
+  // banner), so it outweighs what usage statistics can say about a code diff.
+  const declared = declaredBrandColors(cssVariables);
+  for (const c of clusters) {
+    c.declared = declared.reduce(
+      (best, d) => (colorDistance(c.representative, d.parsed) < 15 ? Math.max(best, d.weight) : best), 0);
+  }
+
+  const chromaOf = (c) => ((100 - Math.abs(2 * c.lightness - 100)) * c.saturation) / 100;
   function brandScore(c) {
-    const chroma = ((100 - Math.abs(2 * c.lightness - 100)) * c.saturation) / 100;
+    const chroma = chromaOf(c);
     const colourful = Math.min(1, chroma / 30);
     return chroma + colourful * (
       40 * Math.log2(1 + c.interactiveBg)
       + 25 * Math.log10(Math.max(1, c.count))
       + 60 * Math.sqrt(c.areaShare || 0)
-    );
+    ) + BRAND_VAR_BONUS * c.declared;
   }
   // The browser's default link colours say nothing about the brand.
   const UA_LINK_COLORS = new Set(['#0000ee', '#551a8b']);
-  const ranked = [...chromatic]
+  const scored = [...chromatic]
     .filter((c) => !UA_LINK_COLORS.has(c.hex))
     .sort((a, b) => brandScore(b) - brandScore(a));
+
+  // Chroma alone ranks any pure primary first: linear.app's code-diff
+  // highlights (#00ff05 on 19 spans, #ff0000 on 6, under 0.03% of the painted
+  // area) came out as secondary and accent. A colour is a candidate for a role
+  // only if something other than saturation vouches for it: it fills a button
+  // or is a link colour, or covers a visible share of the page, or is declared.
+  // Near-black and near-white surfaces never qualify on their own account
+  // (github.com's #0d1117 canvas is nobody's accent). A page where nothing
+  // qualifies keeps the old order.
+  const MIN_ROLE_AREA_SHARE = 0.005;
+  const MIN_ROLE_CHROMA = 15;
+  const vouched = (c) => c.declared > 0 || (chromaOf(c) >= MIN_ROLE_CHROMA
+    && (c.interactiveBg > 0 || c.interactiveText > 0 || (c.areaShare || 0) >= MIN_ROLE_AREA_SHARE));
+  const evidenced = scored.filter(vouched);
+  const ranked = evidenced.length ? evidenced : scored;
 
   const primary = ranked[0] || null;
   // secondary: distinct hue from primary
